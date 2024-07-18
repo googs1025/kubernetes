@@ -424,6 +424,17 @@ func (d *DefaultLimitRangerActions) SupportsAttributes(a admission.Attributes) b
 	// Since containers and initContainers cannot currently be added, removed, or updated, it is unnecessary
 	// to mutate and validate limitrange on pod updates. Trying to mutate containers or initContainers on a pod
 	// update request will always fail pod validation because those fields are immutable once the object is created.
+	// Since containers and initContainers cannot currently be added, removed, or updated, it is unnecessary
+	// to mutate and validate limitrange on pod updates. Trying to mutate containers or initContainers on a pod
+	// update request will always fail pod validation because those fields are immutable once the object is created.
+
+	// If in-place vertical scaling is enabled, we should ignore the pod update request.
+	//if feature.DefaultFeatureGate.Enabled(features.InPlacePodVerticalScaling) {
+	//	if a.GetKind().GroupKind() == api.Kind("Pod") && a.GetOperation() == admission.Update {
+	//		return false
+	//	}
+	//}
+
 	if a.GetKind().GroupKind() == api.Kind("Pod") && a.GetOperation() == admission.Update {
 		return false
 	}

@@ -34,13 +34,16 @@ import (
 	"k8s.io/apiserver/pkg/admission"
 	genericadmissioninitializer "k8s.io/apiserver/pkg/admission/initializer"
 	admissiontesting "k8s.io/apiserver/pkg/admission/testing"
+	"k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/informers"
 	clientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	core "k8s.io/client-go/testing"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 
 	api "k8s.io/kubernetes/pkg/apis/core"
 	v1 "k8s.io/kubernetes/pkg/apis/core/v1"
+	"k8s.io/kubernetes/pkg/features"
 )
 
 func getComputeResourceList(cpu, memory string) api.ResourceList {
@@ -750,6 +753,58 @@ func TestLimitRangerIgnoresSubresource(t *testing.T) {
 	err = handler.Validate(context.TODO(), admission.NewAttributesRecord(&testPod, nil, api.Kind("Pod").WithVersion("version"), limitRange.Namespace, "testPod", api.Resource("pods").WithVersion("version"), "status", admission.Update, &metav1.UpdateOptions{}, false, nil), nil)
 	if err != nil {
 		t.Errorf("Should have ignored calls to any subresource of pod %v", err)
+	}
+
+}
+
+func TestLimitRangerIgnoresSubresource1(t *testing.T) {
+	var (
+		limitRange = validLimitRangeNoDefaults()
+		testPod    = validPod("testPod", 1, api.ResourceRequirements{})
+	)
+
+	tests := []struct {
+		name                                      string
+		attributesRecord                          admission.Attributes
+		isUseInPlacePodVerticalScalingFeatureGate bool
+	}{
+		{
+			name:             "",
+			attributesRecord: admission.NewAttributesRecord(&testPod, nil, api.Kind("Pod").WithVersion("version"), limitRange.Namespace, "testPod", api.Resource("pods").WithVersion("version"), "", admission.Create, &metav1.CreateOptions{}, false, nil),
+		},
+		{
+			name: "",
+			isUseInPlacePodVerticalScalingFeatureGate: true,
+			attributesRecord: admission.NewAttributesRecord(&testPod, nil, api.Kind("Pod").WithVersion("version"), limitRange.Namespace, "testPod", api.Resource("pods").WithVersion("version"), "", admission.Update, &metav1.UpdateOptions{}, false, nil),
+		},
+		{
+			name: "",
+			isUseInPlacePodVerticalScalingFeatureGate: false,
+			attributesRecord: admission.NewAttributesRecord(&testPod, nil, api.Kind("Pod").WithVersion("version"), limitRange.Namespace, "testPod", api.Resource("pods").WithVersion("version"), "status", admission.Update, &metav1.UpdateOptions{}, false, nil),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.isUseInPlacePodVerticalScalingFeatureGate {
+				featuregatetesting.SetFeatureGateDuringTest(t, feature.DefaultFeatureGate, features.InPlacePodVerticalScaling, true)
+			}
+			mockClient := newMockClientForTest([]corev1.LimitRange{limitRange})
+			handler, informerFactory, err := newHandlerForTest(mockClient)
+			if err != nil {
+				t.Errorf("unexpected error initializing handler: %v", err)
+			}
+			informerFactory.Start(wait.NeverStop)
+			informerFactory.WaitForCacheSync(wait.NeverStop)
+			err = admissiontesting.WithReinvocationTesting(t, handler).Admit(context.TODO(), tc.attributesRecord, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = handler.Validate(context.TODO(), tc.attributesRecord, nil)
+			if err != nil {
+				t.Errorf("Expected an error since the pod did not specify resource limits in its create call")
+			}
+		})
 	}
 
 }
