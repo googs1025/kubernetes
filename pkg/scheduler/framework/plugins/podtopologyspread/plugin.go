@@ -243,9 +243,6 @@ func (pl *PodTopologySpread) getConstraints(pod *v1.Pod) ([]topologySpreadConstr
 }
 
 // isSchedulableAfterNodeChange returns Queue when node has topologyKey in its labels, else return QueueSkip.
-//
-// TODO: we can filter out node update events in a more fine-grained way once preCheck is completely removed.
-// See: https://github.com/kubernetes/kubernetes/issues/110175
 func (pl *PodTopologySpread) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
 	originalNode, modifiedNode, err := util.As[*v1.Node](oldObj, newObj)
 	if err != nil {
@@ -257,23 +254,50 @@ func (pl *PodTopologySpread) isSchedulableAfterNodeChange(logger klog.Logger, po
 		return framework.Queue, err
 	}
 
+	// When queuing this Pod:
+	// 1. If the original node exists and the modified node is nil (node deletion):
+	//   - Return Queue if the original node had a topology key that matches the pod's topology spread constraints.
+	//   - Return QueueSkip otherwise.
+	// 2. If the original node exists and the modified node also exists (node update):
+	//   - Return Queue if the original node did not match the constraints but the modified node does.
+	//   - Return QueueSkip otherwise.
+	// 3. If the original node is nil and the modified node exists (node addition):
+	//   - Return Queue if the modified node has a topology key that matches the pod's topology spread constraints.
+	//   - Return QueueSkip otherwise.
+	// 4. If none of the above conditions are met, return QueueSkip.
+	if originalNode != nil {
+		// framework.Delete: return Queue when node has topologyKey in its labels, else return QueueSkip.
+		if modifiedNode == nil {
+			if !nodeLabelsMatchSpreadConstraints(originalNode.Labels, constraints) {
+				logger.V(5).Info("The deleted node doesn't match pod topology spread constraints",
+					"pod", klog.KObj(pod), "node", klog.KObj(originalNode))
+				return framework.QueueSkip, nil
+			}
+			logger.V(5).Info("Node that matches topology spread constraints was deleted, and the pod may be schedulable now",
+				"pod", klog.KObj(pod), "node", klog.KObj(originalNode))
+			return framework.Queue, nil
+		}
+		// framework.Update: return Queue when node has topologyKey in its labels, else return QueueSkip.
+		if !nodeLabelsMatchSpreadConstraints(originalNode.Labels, constraints) && nodeLabelsMatchSpreadConstraints(modifiedNode.Labels, constraints) {
+			logger.V(5).Info("The updated node now matches pod topology spread constraints",
+				"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+			return framework.Queue, nil
+		}
+	}
+
 	if modifiedNode != nil {
+		// framework.Add: return Queue when node has topologyKey in its labels, else return QueueSkip.
 		if !nodeLabelsMatchSpreadConstraints(modifiedNode.Labels, constraints) {
-			logger.V(5).Info("the created/updated node doesn't match pod topology spread constraints",
+			logger.V(5).Info("The created node doesn't match pod topology spread constraints",
 				"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
 			return framework.QueueSkip, nil
 		}
-		logger.V(5).Info("node that match topology spread constraints was created/updated, and the pod may be schedulable now",
+		logger.V(5).Info("Node that matches topology spread constraints was created, and the pod may be schedulable now",
 			"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
 		return framework.Queue, nil
 	}
 
-	// framework.Delete: return Queue when node has topologyKey in its labels, else return QueueSkip.
-	if !nodeLabelsMatchSpreadConstraints(originalNode.Labels, constraints) {
-		logger.V(5).Info("the deleted node doesn't match pod topology spread constraints", "pod", klog.KObj(pod), "node", klog.KObj(originalNode))
-		return framework.QueueSkip, nil
-	}
-	logger.V(5).Info("node that match topology spread constraints was deleted, and the pod may be schedulable now",
-		"pod", klog.KObj(pod), "node", klog.KObj(originalNode))
-	return framework.Queue, nil
+	logger.V(5).Info("The updated node doesn't match pod topology spread constraints",
+		"pod", klog.KObj(pod), "node", klog.KObj(modifiedNode))
+	return framework.QueueSkip, nil
 }
