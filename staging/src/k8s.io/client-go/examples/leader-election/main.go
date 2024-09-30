@@ -57,6 +57,7 @@ func main() {
 	var leaseLockName string
 	var leaseLockNamespace string
 	var id string
+	var startedLeading bool
 
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "absolute path to the kubeconfig file")
 	flag.StringVar(&id, "id", uuid.New().String(), "the holder identity name")
@@ -135,12 +136,24 @@ func main() {
 			OnStartedLeading: func(ctx context.Context) {
 				// we're notified when we start - this is where you would
 				// usually put your code
+				startedLeading = true
 				run(ctx)
 			},
 			OnStoppedLeading: func() {
-				// we can do cleanup here
+				// we can do cleanup here, but note that this callback is always called
+				// when the LeaderElector exits, even if it did not start leading.
+				// Therefore, you should check if you actually started leading before
+				// performing any cleanup operations to avoid unexpected behavior.
 				klog.Infof("leader lost: %s", id)
-				os.Exit(0)
+
+				// Example check to ensure we only perform cleanup if we actually started leading
+				if startedLeading {
+					// Perform cleanup operations here
+					// For example, releasing resources, closing connections, etc.
+					klog.Info("Performing cleanup operations...")
+				} else {
+					klog.Info("No cleanup needed as we never started leading.")
+				}
 			},
 			OnNewLeader: func(identity string) {
 				// we're notified when new leader elected
