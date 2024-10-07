@@ -60,6 +60,9 @@ const (
 	// defaultBurst is the default burst to be used with the discovery client's token bucket rate limiter
 	defaultBurst = 300
 
+	// defaultQPS is the default QPS to be used with the discovery client's token bucket rate limiter
+	defaultQPS = 50
+
 	AcceptV1 = runtime.ContentTypeJSON
 	// Aggregated discovery content-type (v2beta1). NOTE: content-type parameters
 	// MUST be ordered (g, v, as) for server in "Accept" header (BUT we are resilient
@@ -723,6 +726,10 @@ func setDiscoveryDefaults(config *restclient.Config) error {
 		// matches burst set by ConfigFlags#ToDiscoveryClient().
 		// see https://issue.k8s.io/86149
 		config.Burst = defaultBurst
+	}
+	// if a QPS is not already configured
+	if config.QPS == 0 {
+		config.QPS = defaultQPS
 	}
 	codec := runtime.NoopEncoder{Decoder: scheme.Codecs.UniversalDecoder()}
 	config.NegotiatedSerializer = serializer.NegotiatedSerializerWrapper(runtime.SerializerInfo{Serializer: codec})

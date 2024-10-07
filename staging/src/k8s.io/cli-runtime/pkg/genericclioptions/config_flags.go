@@ -475,6 +475,11 @@ func NewConfigFlags(usePersistentConfig bool) *ConfigFlags {
 		// with a burst of 300, we will not be rate-limiting for most clusters but
 		// the safeguard will still be here. This config is only used for discovery.
 		discoveryBurst: 300,
+		// discoveryQPS indicates the maximum queries per second (QPS) for discovery requests.
+		// A higher QPS value allows for faster discovery of API resources, which can be beneficial
+		// in large clusters with many API groups. Setting this to 50.0 ensures that discovery
+		// operations can proceed efficiently without being rate-limited.
+		discoveryQPS: 50.0,
 	}
 }
 
