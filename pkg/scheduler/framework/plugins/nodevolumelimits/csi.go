@@ -89,7 +89,7 @@ func (pl *CSILimits) EventsToRegister(_ context.Context) ([]framework.ClusterEve
 		{Event: framework.ClusterEvent{Resource: framework.CSINode, ActionType: framework.Add}},
 		{Event: framework.ClusterEvent{Resource: framework.Pod, ActionType: framework.Delete}, QueueingHintFn: pl.isSchedulableAfterPodDeleted},
 		{Event: framework.ClusterEvent{Resource: framework.PersistentVolumeClaim, ActionType: framework.Add}, QueueingHintFn: pl.isSchedulableAfterPVCAdded},
-		{Event: framework.ClusterEvent{Resource: framework.VolumeAttachment, ActionType: framework.Delete}},
+		{Event: framework.ClusterEvent{Resource: framework.VolumeAttachment, ActionType: framework.Delete}, QueueingHintFn: pl.isSchedulableAfterVolumeAttachmentDeleted},
 	}, nil
 }
 
@@ -146,6 +146,29 @@ func (pl *CSILimits) isSchedulableAfterPVCAdded(logger klog.Logger, pod *v1.Pod,
 	}
 
 	logger.V(5).Info("PVC irrelevant to the Pod was created, which doesn't make this pod schedulable", "pod", klog.KObj(pod), "PVC", klog.KObj(addedPvc))
+	return framework.QueueSkip, nil
+}
+
+func (pl *CSILimits) isSchedulableAfterVolumeAttachmentDeleted(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (framework.QueueingHint, error) {
+	deletedVolumeAttachment, _, err := util.As[*storagev1.VolumeAttachment](oldObj, newObj)
+	if err != nil {
+		return framework.Queue, fmt.Errorf("unexpected objects in isSchedulableAfterVolumeAttachmentDeleted: %w", err)
+	}
+
+	if deletedVolumeAttachment.Spec.NodeName == "" {
+		logger.V(5).Info("The deleted VolumeAttachment does not specify a NodeName and does not impact scheduling, which might make this pod schedulable",
+			"volumeAttachment", klog.KRef(deletedVolumeAttachment.Namespace, deletedVolumeAttachment.Name))
+		return framework.QueueSkip, nil
+	}
+
+	for _, vol := range pod.Spec.Volumes {
+		if vol.PersistentVolumeClaim != nil || pl.translator.IsInlineMigratable(&vol) {
+			logger.V(5).Info("Pod volume uses PersistentVolumeClaim, or is an Inline Migratable volume, which might make this pod schedulable",
+				"pod", klog.KObj(pod),
+				"volume", vol.Name)
+			return framework.Queue, nil
+		}
+	}
 	return framework.QueueSkip, nil
 }
 
