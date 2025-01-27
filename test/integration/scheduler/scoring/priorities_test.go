@@ -19,6 +19,8 @@ package scoring
 import (
 	"context"
 	"fmt"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
+	"math/rand"
 	"strings"
 	"testing"
 	"time"
@@ -71,8 +73,11 @@ const (
 	pollInterval = 100 * time.Millisecond
 )
 
-// This file tests the scheduler priority functions.
-func initTestSchedulerForPriorityTest(t *testing.T, preScorePluginName, scorePluginName string) *testutils.TestContext {
+// initTestSchedulerForScoringTests initializes the test environment for scheduler scoring function tests.
+// It configures a scheduler configuration, enabling the specified prescore and score plugins,
+// while disabling all other plugins.
+// This setup ensures that only the desired plugins are active during the integration test.
+func initTestSchedulerForScoringTests(t *testing.T, preScorePluginName, scorePluginName string) *testutils.TestContext {
 	cc := configv1.KubeSchedulerConfiguration{
 		Profiles: []configv1.KubeSchedulerProfile{{
 			SchedulerName: pointer.String(v1.DefaultSchedulerName),
@@ -290,7 +295,7 @@ func TestNodeResourcesScoring(t *testing.T) {
 // TestNodeAffinityScoring verifies that scheduler's node affinity priority function
 // works correctly.
 func TestNodeAffinityScoring(t *testing.T) {
-	testCtx := initTestSchedulerForPriorityTest(t, nodeaffinity.Name, nodeaffinity.Name)
+	testCtx := initTestSchedulerForScoringTests(t, nodeaffinity.Name, nodeaffinity.Name)
 	// Add a few nodes.
 	_, err := createAndWaitForNodesInCache(testCtx, "testnode", st.MakeNode(), 4)
 	if err != nil {
@@ -726,7 +731,7 @@ func TestPodAffinityScoring(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MatchLabelKeysInPodAffinity, tt.enableMatchLabelKeysInAffinity)
 
-			testCtx := initTestSchedulerForPriorityTest(t, interpodaffinity.Name, interpodaffinity.Name)
+			testCtx := initTestSchedulerForScoringTests(t, interpodaffinity.Name, interpodaffinity.Name)
 			if err := createNamespacesWithLabels(testCtx.ClientSet, []string{"ns1", "ns2"}, map[string]string{"team": "team1"}); err != nil {
 				t.Fatal(err)
 			}
@@ -756,10 +761,140 @@ func TestPodAffinityScoring(t *testing.T) {
 	}
 }
 
+func TestTaintTolerationScoring(t *testing.T) {
+	tests := []struct {
+		name           string
+		podTolerations []v1.Toleration
+		nodes          []*v1.Node
+		// expectedNodesName is a list of nodes that the pod should potentially be scheduled on.
+		// It is used to verify that the pod is scheduled on the expected nodes.
+		expectedNodesName []string
+	}{
+		{
+			name:           "no taints or tolerations",
+			podTolerations: []v1.Toleration{},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+						"nvidia.com/gpu":  "4",
+					}).Obj(),
+				st.MakeNode().Name("node-2").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+						"nvidia.com/gpu":  "4",
+					}).Obj(),
+			},
+			expectedNodesName: []string{"node-1", "node-2"},
+		},
+		{
+			name: "pod with toleration for node's taint",
+			podTolerations: []v1.Toleration{
+				{
+					Key:      "example-key",
+					Operator: v1.TolerationOpEqual,
+					Value:    "example-value",
+					Effect:   v1.TaintEffectPreferNoSchedule,
+				},
+			},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+					}).Taints([]v1.Taint{
+					{
+						Key:    "example-key",
+						Value:  "example-value",
+						Effect: v1.TaintEffectPreferNoSchedule,
+					},
+				}).Obj(),
+				st.MakeNode().Name("node-2").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+					}).Obj(),
+			},
+			expectedNodesName: []string{"node-1", "node-2"},
+		},
+		{
+			name: "pod without toleration for node's taint",
+			podTolerations: []v1.Toleration{
+				{
+					Key:      "other-key",
+					Operator: v1.TolerationOpEqual,
+					Value:    "other-value",
+					Effect:   v1.TaintEffectPreferNoSchedule,
+				},
+			},
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+					}).Taints([]v1.Taint{
+					{
+						Key:    "example-key",
+						Value:  "example-value",
+						Effect: v1.TaintEffectPreferNoSchedule,
+					},
+				}).Obj(),
+				st.MakeNode().Name("node-2").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "8",
+						v1.ResourceMemory: "16G",
+					}).Obj(),
+			},
+			expectedNodesName: []string{"node-2"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTestSchedulerForScoringTests(t, tainttoleration.Name, tainttoleration.Name)
+
+			for _, n := range tt.nodes {
+				if _, err := createNode(testCtx.ClientSet, n); err != nil {
+					t.Fatalf("failed to create node: %v", err)
+				}
+			}
+
+			// Create a dummy pod with the given tolerations
+			pod := &v1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: testCtx.NS.Name,
+					Name:      fmt.Sprintf("test-pod-%v", rand.Int()),
+				},
+				Spec: v1.PodSpec{
+					Tolerations: tt.podTolerations,
+					Containers: []v1.Container{
+						{
+							Name:  "test-container",
+							Image: imageutils.GetPauseImageName(),
+						},
+					},
+				},
+			}
+
+			pod, err := runPausePod(testCtx.ClientSet, pod)
+			if err != nil {
+				t.Fatalf("Error running pause pod: %v", err)
+			}
+			defer testutils.CleanupPods(testCtx.Ctx, testCtx.ClientSet, t, []*v1.Pod{pod})
+
+			err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false, podScheduledIn(testCtx.ClientSet, pod.Namespace, pod.Name, tt.expectedNodesName))
+			if err != nil {
+				t.Errorf("Error while trying to wait for a pod to be scheduled: %v", err)
+			}
+		})
+	}
+}
+
 // TestImageLocalityScoring verifies that the scheduler's image locality priority function
 // works correctly, i.e., the pod gets scheduled to the node where its container images are ready.
 func TestImageLocalityScoring(t *testing.T) {
-	testCtx := initTestSchedulerForPriorityTest(t, "", imagelocality.Name)
+	testCtx := initTestSchedulerForScoringTests(t, "", imagelocality.Name)
 
 	// Create a node with the large image.
 	// We use a fake large image as the test image used by the pod, which has
@@ -991,7 +1126,7 @@ func TestPodTopologySpreadScoring(t *testing.T) {
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.NodeInclusionPolicyInPodTopologySpread, tt.enableNodeInclusionPolicy)
 			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.MatchLabelKeysInPodTopologySpread, tt.enableMatchLabelKeys)
 
-			testCtx := initTestSchedulerForPriorityTest(t, podtopologyspread.Name, podtopologyspread.Name)
+			testCtx := initTestSchedulerForScoringTests(t, podtopologyspread.Name, podtopologyspread.Name)
 			cs := testCtx.ClientSet
 			ns := testCtx.NS.Name
 
@@ -1044,7 +1179,7 @@ func TestPodTopologySpreadScoring(t *testing.T) {
 // with the system default spreading spreads Pods belonging to a Service.
 // The setup has 300 nodes over 3 zones.
 func TestDefaultPodTopologySpreadScoring(t *testing.T) {
-	testCtx := initTestSchedulerForPriorityTest(t, podtopologyspread.Name, podtopologyspread.Name)
+	testCtx := initTestSchedulerForScoringTests(t, podtopologyspread.Name, podtopologyspread.Name)
 	cs := testCtx.ClientSet
 	ns := testCtx.NS.Name
 

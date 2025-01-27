@@ -316,6 +316,21 @@ func (p *PodWrapper) GenerateName(s string) *PodWrapper {
 	return p
 }
 
+func (p *PodWrapper) Tolerations(tolerations []v1.Toleration) *PodWrapper {
+	p.Spec.Tolerations = tolerations
+	return p
+}
+
+func (p *PodWrapper) NodeName(node string) *PodWrapper {
+	p.Spec.NodeName = node
+	return p
+}
+
+func (p *PodWrapper) NodeAffinity(nodeAffinity *v1.NodeAffinity) *PodWrapper {
+	p.Spec.Affinity.NodeAffinity = nodeAffinity
+	return p
+}
+
 // UID sets `s` as the UID of the inner pod.
 func (p *PodWrapper) UID(s string) *PodWrapper {
 	p.SetUID(types.UID(s))

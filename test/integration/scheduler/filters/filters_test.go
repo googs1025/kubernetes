@@ -52,6 +52,7 @@ var (
 	initPausePod                 = testutils.InitPausePod
 	initTest                     = testutils.InitTestSchedulerWithNS
 	podScheduledIn               = testutils.PodScheduledIn
+	podScheduled                 = testutils.PodScheduled
 	podUnschedulable             = testutils.PodUnschedulable
 	waitForPodUnschedulable      = testutils.WaitForPodUnschedulable
 )
@@ -2313,5 +2314,710 @@ func TestPodAffinityMatchLabelKeyEnablement(t *testing.T) {
 	if d := cmp.Diff(gotpod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].LabelSelector, pod.Spec.Affinity.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution[0].LabelSelector); d != "" {
 		t.Fatalf("Pod %v has wrong label selector: diff = \n%v", p2.Name, d)
 	}
+}
 
+func TestNodePortsFilter(t *testing.T) {
+	pause := imageutils.GetPauseImageName()
+	tests := []struct {
+		name         string
+		nodes        []*v1.Node
+		existingPods []*v1.Pod
+		incomingPod  *v1.Pod
+		fit          bool
+	}{
+		{
+			name: "Port Conflict on Node",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-0").Capacity(
+					map[v1.ResourceName]string{v1.ResourceCPU: "500m", v1.ResourceMemory: "400"},
+				).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("test-1").
+					Containers([]v1.Container{st.MakeContainer().Name("test-1-container").Image(pause).
+						ContainerPort([]v1.ContainerPort{
+							{
+								HostIP:        "127.0.0.1",
+								ContainerPort: 8081,
+								HostPort:      8081,
+								Protocol:      "TCP",
+							},
+							{
+								HostIP:        "127.0.0.1",
+								ContainerPort: 8082,
+								HostPort:      8082,
+								Protocol:      "TCP",
+							},
+						}).Obj()}).
+					Obj(),
+			},
+			incomingPod: st.MakePod().Name("test-2").
+				Containers([]v1.Container{st.MakeContainer().Name("test-2-container").Image(pause).
+					ContainerPort([]v1.ContainerPort{
+						{
+							HostIP:        "127.0.0.1",
+							ContainerPort: 8081,
+							HostPort:      8081,
+							Protocol:      "TCP",
+						},
+					}).Obj()}).
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "No Port Conflict on Node",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-0").Capacity(
+					map[v1.ResourceName]string{v1.ResourceCPU: "500m", v1.ResourceMemory: "400"},
+				).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("test-1").
+					Containers([]v1.Container{st.MakeContainer().Name("test-1-container").Image(pause).
+						ContainerPort([]v1.ContainerPort{
+							{
+								HostIP:        "127.0.0.1",
+								HostPort:      8081,
+								ContainerPort: 8081,
+								Protocol:      "TCP",
+							},
+							{
+								HostIP:        "127.0.0.1",
+								HostPort:      8082,
+								ContainerPort: 8082,
+								Protocol:      "TCP",
+							},
+						}).Obj()}).
+					Obj(),
+			},
+			incomingPod: st.MakePod().Name("test-2").
+				Containers([]v1.Container{st.MakeContainer().Name("test-2-container").Image(pause).
+					ContainerPort([]v1.ContainerPort{
+						{
+							HostIP:        "127.0.0.1",
+							HostPort:      8080,
+							ContainerPort: 8080,
+							Protocol:      "TCP",
+						},
+					}).Obj()}).
+				Obj(),
+			fit: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "node-ports-filter")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			for i := range tt.nodes {
+				if _, err := createNode(cs, tt.nodes[i]); err != nil {
+					t.Fatalf("Cannot create node: %v", err)
+				}
+			}
+
+			// set namespace to pods
+			tt.incomingPod.SetNamespace(ns)
+			for i := range tt.existingPods {
+				tt.existingPods[i].SetNamespace(ns)
+			}
+
+			allPods := append(tt.existingPods, tt.incomingPod)
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, allPods)
+
+			for _, pod := range tt.existingPods {
+				createdPod, err := cs.CoreV1().Pods(pod.Namespace).Create(testCtx.Ctx, pod, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("Error while creating pod during test: %v", err)
+				}
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					testutils.PodScheduled(cs, createdPod.Namespace, createdPod.Name))
+				if err != nil {
+					t.Errorf("Error while waiting for pod during test: %v", err)
+				}
+			}
+
+			testPod, err := cs.CoreV1().Pods(tt.incomingPod.Namespace).Create(testCtx.Ctx, tt.incomingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod during test: %v", err)
+			}
+
+			if tt.fit {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Test Failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeResourcesFilter(t *testing.T) {
+	pause := imageutils.GetPauseImageName()
+	tests := []struct {
+		name         string
+		nodes        []*v1.Node
+		existingPods []*v1.Pod
+		incomingPod  *v1.Pod
+		fit          bool
+	}{
+		{
+			name: "pod does not fit due to insufficient node resources",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("insufficient-node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "2",
+						v1.ResourceMemory: "2G",
+					}).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("insufficient-existing-pod-1").
+					Res(map[v1.ResourceName]string{
+						v1.ResourceCPU:    "1",
+						v1.ResourceMemory: "1G",
+					}).Container(pause).
+					Obj(),
+			},
+			incomingPod: st.MakePod().Name("insufficient-incoming-pod-1").
+				Res(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "3",
+					v1.ResourceMemory: "3G",
+				}).Container(pause).
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "pod fits with sufficient node resources",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("sufficient-node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "3",
+						v1.ResourceMemory: "3G",
+					}).Obj(),
+			},
+			existingPods: []*v1.Pod{
+				st.MakePod().Name("sufficient-existing-pod-1").
+					Res(map[v1.ResourceName]string{
+						v1.ResourceCPU:    "1",
+						v1.ResourceMemory: "1G",
+					}).Container(pause).
+					Obj(),
+			},
+			incomingPod: st.MakePod().Name("sufficient-incoming-pod-1").
+				Res(map[v1.ResourceName]string{
+					v1.ResourceCPU:    "1",
+					v1.ResourceMemory: "1G",
+				}).Container(pause).
+				Obj(),
+			fit: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "node-resources-filter")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			for i := range tt.nodes {
+				if _, err := createNode(cs, tt.nodes[i]); err != nil {
+					t.Fatalf("Cannot create node: %v", err)
+				}
+			}
+
+			// set namespace to pods
+			tt.incomingPod.SetNamespace(ns)
+			for i := range tt.existingPods {
+				tt.existingPods[i].SetNamespace(ns)
+			}
+
+			allPods := append(tt.existingPods, tt.incomingPod)
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, allPods)
+
+			for _, pod := range tt.existingPods {
+				createdPod, err := cs.CoreV1().Pods(pod.Namespace).Create(testCtx.Ctx, pod, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("Error while creating pod during test: %v", err)
+				}
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					testutils.PodScheduled(cs, createdPod.Namespace, createdPod.Name))
+				if err != nil {
+					t.Errorf("Error while waiting for pod during test: %v", err)
+				}
+			}
+			testPod, err := cs.CoreV1().Pods(tt.incomingPod.Namespace).Create(testCtx.Ctx, tt.incomingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod during test: %v", err)
+			}
+
+			if tt.fit {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Test Failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestTaintTolerationFilter(t *testing.T) {
+	pause := imageutils.GetPauseImageName()
+	tests := []struct {
+		name        string
+		nodes       []*v1.Node
+		incomingPod *v1.Pod
+		fit         bool
+	}{
+		{
+			name: "Pod tolerates node taint",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-1").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "2",
+						v1.ResourceMemory: "2G",
+					}).Taints([]v1.Taint{
+					{
+						Key:    "example.com/taint1",
+						Value:  "value1",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+				}).Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-1").
+				Tolerations([]v1.Toleration{
+					{
+						Key:    "example.com/taint1",
+						Value:  "value1",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+				}).Container(pause).
+				Obj(),
+			fit: true,
+		},
+		{
+			name: "Pod does not tolerate node taint",
+			nodes: []*v1.Node{st.MakeNode().Name("node-2").Capacity(
+				map[v1.ResourceName]string{
+					v1.ResourceCPU:    "2",
+					v1.ResourceMemory: "2G",
+				}).Taints([]v1.Taint{
+				{
+					Key:    "example.com/taint1",
+					Value:  "value1",
+					Effect: v1.TaintEffectNoSchedule,
+				},
+			}).Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-2").
+				Container(pause).
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "Pod tolerates some but not all node taints",
+			nodes: []*v1.Node{st.MakeNode().Name("node-3").Capacity(
+				map[v1.ResourceName]string{
+					v1.ResourceCPU:    "2",
+					v1.ResourceMemory: "2G",
+				}).Taints([]v1.Taint{
+				{
+					Key:    "example.com/taint1",
+					Value:  "value1",
+					Effect: v1.TaintEffectNoSchedule,
+				},
+				{
+					Key:    "example.com/taint2",
+					Value:  "value2",
+					Effect: v1.TaintEffectNoSchedule,
+				},
+			}).Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-3").
+				Tolerations([]v1.Toleration{
+					{
+						Key:    "example.com/taint1",
+						Value:  "value1",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+				}).Container(pause).
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "Pod tolerates all node taints",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-4").Capacity(
+					map[v1.ResourceName]string{
+						v1.ResourceCPU:    "2",
+						v1.ResourceMemory: "2G",
+					}).Taints([]v1.Taint{
+					{
+						Key:    "example.com/taint1",
+						Value:  "value1",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+					{
+						Key:    "example.com/taint2",
+						Value:  "value2",
+						Effect: v1.TaintEffectNoSchedule,
+					},
+				}).Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-4").Tolerations([]v1.Toleration{
+				{
+					Key:    "example.com/taint1",
+					Value:  "value1",
+					Effect: v1.TaintEffectNoSchedule,
+				},
+				{
+					Key:    "example.com/taint2",
+					Value:  "value2",
+					Effect: v1.TaintEffectNoSchedule,
+				},
+			}).Container(pause).Obj(),
+			fit: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "taint-toleration-filter")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			for i := range tt.nodes {
+				if _, err := createNode(cs, tt.nodes[i]); err != nil {
+					t.Fatalf("Cannot create node: %v", err)
+				}
+			}
+
+			// set namespace to pods
+			tt.incomingPod.SetNamespace(ns)
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{tt.incomingPod})
+
+			testPod, err := cs.CoreV1().Pods(tt.incomingPod.Namespace).Create(testCtx.Ctx, tt.incomingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod during test: %v", err)
+			}
+
+			if tt.fit {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Test Failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeNameFilter(t *testing.T) {
+	pause := imageutils.GetPauseImageName()
+	tests := []struct {
+		name        string
+		nodes       []*v1.Node
+		incomingPod *v1.Pod
+		fit         bool
+	}{
+		{
+			name: "Pod fits the node by name",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-0").Obj(),
+			},
+			incomingPod: st.MakePod().Container(pause).
+				Name("test-pod").
+				NodeName("node-0").
+				Obj(),
+			fit: true,
+		},
+		{
+			name: "Pod does not fit because specified nodeName does not exist",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-0").Obj(),
+			},
+			incomingPod: st.MakePod().
+				Name("test-pod").Container(pause).
+				NodeName("nonexistent-node").
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "Pod without nodeName should fit any node",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-0").Obj(),
+			},
+			incomingPod: st.MakePod().Container(pause).
+				Name("test-pod").
+				Obj(),
+			fit: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "nodename-filter")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			// Create nodes.
+			for _, node := range tt.nodes {
+				if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+					t.Fatalf("Failed to create node: %v", err)
+				}
+			}
+
+			// Set namespace for pods and create them.
+			tt.incomingPod.SetNamespace(ns)
+
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{tt.incomingPod})
+
+			// Attempt to schedule the incoming pod.
+			testPod, err := cs.CoreV1().Pods(tt.incomingPod.Namespace).Create(testCtx.Ctx, tt.incomingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod during test: %v", err)
+			}
+
+			if tt.fit {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Test Failed: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeAffinityFilter(t *testing.T) {
+	pause := imageutils.GetPauseImageName()
+	tests := []struct {
+		name         string
+		nodes        []*v1.Node
+		existingPods []*v1.Pod // 在此示例中可能不需要现有Pod，但保持一致性。
+		incomingPod  *v1.Pod
+		fit          bool
+	}{
+		{
+			name: "pod fits with required node affinity",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-ssd").Label("disktype", "ssd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("affinity-fitting-pod").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"ssd"},
+									},
+								},
+							},
+						},
+					},
+				}).Container(pause).
+				Obj(),
+			fit: true,
+		},
+		{
+			name: "pod does not fit due to node affinity requirements",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-ssd").Label("disktype", "ssd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("affinity-non-fitting-pod").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"hdd"},
+									},
+								},
+							},
+						},
+					},
+				}).
+				Container(pause).
+				Obj(),
+			fit: false,
+		},
+		{
+			name: "pod fits with required node affinity using both MatchExpressions and MatchFields",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("affinity-matching-node-1").Label("disktype", "ssd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("affinity-fitting-pod").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"ssd"},
+									},
+								},
+								MatchFields: []v1.NodeSelectorRequirement{
+									{
+										Key:      "metadata.name",
+										Operator: v1.NodeSelectorOpIn,
+										Values:   []string{"affinity-matching-node-1"},
+									},
+								},
+							},
+						},
+					},
+				}).Container(pause).
+				Obj(),
+			fit: true,
+		},
+		{
+			name: "pod does not fit due to NotIn operator",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-hdd").Label("disktype", "hdd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-avoid-hdd").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpNotIn,
+										Values:   []string{"hdd"},
+									},
+								},
+							},
+						},
+					},
+				}).Container(imageutils.GetPauseImageName()).
+				Obj(),
+			fit: true, // 因为存在符合条件的 ssd 节点
+		},
+		{
+			name: "pod fits if disktype label exists on the node",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-with-disktype").Label("disktype", "ssd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-requires-any-disktype").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpExists,
+									},
+								},
+							},
+						},
+					},
+				}).Container(imageutils.GetPauseImageName()).
+				Obj(),
+			fit: true, // 因为存在带有 disktype 标签的节点
+		},
+		{
+			name: "pod fits only if disktype label does not exist on the node",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-with-disktype").Label("disktype", "ssd").Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-avoids-disktype").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchExpressions: []v1.NodeSelectorRequirement{
+									{
+										Key:      "disktype",
+										Operator: v1.NodeSelectorOpDoesNotExist,
+									},
+								},
+							},
+						},
+					},
+				}).Container(imageutils.GetPauseImageName()).
+				Obj(),
+			fit: false, // 因为存在没有 disktype 标签的节点
+		},
+		{
+			name: "pod fits if node has more than 2 CPUs",
+			nodes: []*v1.Node{
+				st.MakeNode().Name("node-low-cpu").Capacity(map[v1.ResourceName]string{v1.ResourceCPU: "2"}).Obj(),
+			},
+			incomingPod: st.MakePod().Name("pod-needs-high-cpu").
+				NodeAffinity(&v1.NodeAffinity{
+					RequiredDuringSchedulingIgnoredDuringExecution: &v1.NodeSelector{
+						NodeSelectorTerms: []v1.NodeSelectorTerm{
+							{
+								MatchFields: []v1.NodeSelectorRequirement{
+									{
+										Key:      "status.capacity.cpu",
+										Operator: v1.NodeSelectorOpGt,
+										Values:   []string{"2"},
+									},
+								},
+							},
+						},
+					},
+				}).Container(imageutils.GetPauseImageName()).
+				Obj(),
+			fit: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCtx := initTest(t, "nodeaffinity-filter")
+			cs := testCtx.ClientSet
+			ns := testCtx.NS.Name
+
+			// Create nodes.
+			for _, node := range tt.nodes {
+				if _, err := cs.CoreV1().Nodes().Create(testCtx.Ctx, node, metav1.CreateOptions{}); err != nil {
+					t.Fatalf("Failed to create node: %v", err)
+				}
+			}
+
+			// Set namespace for pods and create them.
+			tt.incomingPod.SetNamespace(ns)
+
+			defer testutils.CleanupPods(testCtx.Ctx, cs, t, []*v1.Pod{tt.incomingPod})
+
+			// Attempt to schedule the incoming pod.
+			testPod, err := cs.CoreV1().Pods(tt.incomingPod.Namespace).Create(testCtx.Ctx, tt.incomingPod, metav1.CreateOptions{})
+			if err != nil {
+				t.Fatalf("Error while creating pod during test: %v", err)
+			}
+
+			if tt.fit {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podScheduled(cs, testPod.Namespace, testPod.Name))
+			} else {
+				err = wait.PollUntilContextTimeout(testCtx.Ctx, pollInterval, wait.ForeverTestTimeout, false,
+					podUnschedulable(cs, testPod.Namespace, testPod.Name))
+			}
+			if err != nil {
+				t.Errorf("Test Failed: %v", err)
+			}
+		})
+	}
 }
